@@ -1,0 +1,361 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+// Using an enum for roles for better type safety
+enum Role {
+  ORGANIZATION_ADMIN
+  ORGANIZATION_EDITOR
+  ORGANIZATION_VIEWER
+  INDIVIDUAL_USER
+}
+
+enum SubscriptionStatus {
+  ACTIVE
+  TRIALING
+  PAST_DUE
+  CANCELED
+  UNPAID
+  INCOMPLETE // For initial setup before payment confirmation
+  INCOMPLETE_EXPIRED
+}
+
+enum EventStatus {
+  DRAFT
+  UPCOMING
+  ACTIVE
+  COMPLETED
+  ARCHIVED
+}
+
+enum PhotoReviewStatus {
+  PENDING
+  APPROVED
+  REJECTED
+}
+
+enum FaceMatchingTaskStatus {
+  PENDING
+  PROCESSING
+  COMPLETED
+  FAILED
+}
+
+enum PaymentStatus {
+  PENDING
+  SUCCEEDED
+  FAILED
+}
+
+enum InvoiceStatus {
+  DRAFT
+  OPEN
+  PAID
+  VOID
+  UNCOLLECTIBLE
+}
+
+enum ConsentType {
+  PHOTO_STORAGE
+  FACIAL_RECOGNITION
+  DATA_SHARING
+}
+
+enum ConsentActionStatus {
+  GRANTED
+  REVOKED
+}
+
+// Represents a user in the system. Links to external auth if needed.
+model User {
+  id                String  @id @default(cuid())
+  externalSystemId  String? @unique // ID from your pre-existing auth system
+  email             String  @unique
+  passwordHash      String  // Store hashed passwords
+  name              String?
+  profilePhotoUrl   String?
+  role              Role    @default(INDIVIDUAL_USER) // Default role
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+
+  // Relationships
+  organizationMemberships OrganizationUser[]
+  participations        Participant[]
+  uploadedPhotos        EventPhoto[]       @relation("UploadedByUser")
+  consentLogs           ConsentLog[]
+}
+
+model Organization {
+  id                 String  @id @default(cuid())
+  name               String
+  contactInfo        String?
+  address            String?
+  website            String?
+  stripeCustomerId   String? @unique
+  subscriptionStatus SubscriptionStatus? @default(INCOMPLETE)
+  createdAt          DateTime @default(now())
+  updatedAt          DateTime @updatedAt
+
+  // Relationships
+  members         OrganizationUser[]
+  events          Event[]
+  eventCategories EventCategory[]
+  subscriptions   Subscription[]
+  payments        Payment[]
+  invoices        Invoice[]
+}
+
+// Junction table for Organization members and their roles/permissions
+model OrganizationUser {
+  id        String   @id @default(cuid())
+  userId    String
+  orgId     String
+  // permissions String? // Could store JSON or link to a separate permissions table if complex
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+  org  Organization @relation(fields: [orgId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, orgId])
+  @@index([userId])
+  @@index([orgId])
+}
+
+model EventCategory {
+  id          String @id @default(cuid())
+  orgId       String
+  name        String
+  description String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  organization Organization @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  events       Event[]
+
+  @@index([orgId])
+}
+
+model Event {
+  id               String      @id @default(cuid())
+  orgId            String
+  categoryId       String?
+  name             String
+  dateStart        DateTime
+  dateEnd          DateTime?   // Optional end date
+  status           EventStatus @default(DRAFT) // Added status
+  description      String?     // Added description
+  locationName     String?     // Added location name
+  locationAddress  String?     // Added location address
+  isPublic         Boolean     @default(false) // Added public flag
+  createdAt        DateTime    @default(now())
+  updatedAt        DateTime    @updatedAt
+
+  organization Organization  @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  category     EventCategory? @relation(fields: [categoryId], references: [id], onDelete: SetNull) // SetNull allows category deletion without deleting events
+  participants Participant[]
+  photos       EventPhoto[]
+  matchingTasks FaceMatchingTask[]
+
+  @@index([orgId])
+  @@index([categoryId])
+  @@index([dateStart])
+  @@index([status])
+}
+
+model Participant {
+  id                String    @id @default(cuid())
+  eventId           String
+  userId            String?   // Link to internal User if registered
+  name              String?   // Used if not linked to a User
+  email             String?   // Used if not linked to a User
+  registrationStatus String?   // e.g., invited, registered, attended
+  consentStatus     Boolean   @default(false) // Explicit consent recorded for this event participation
+  referencePhotoUrl String?   // Optional reference photo for matching
+  createdAt         DateTime  @default(now())
+  updatedAt         DateTime  @updatedAt
+
+  event Event  @relation(fields: [eventId], references: [id], onDelete: Cascade)
+  user  User?  @relation(fields: [userId], references: [id], onDelete: SetNull) // Allow user deletion without deleting participant record
+  matches PhotoParticipantMatch[]
+  consentLogs ConsentLog[]
+
+  @@index([eventId])
+  @@index([userId])
+  @@index([email]) // Index email if used for lookup
+}
+
+model EventPhoto {
+  id              String            @id @default(cuid())
+  eventId         String
+  uploaderUserId  String            // Link to User (could be OrgUser acting on behalf of org, or IndividualUser)
+  imageUrl        String            // Original image storage location (e.g., S3 URL)
+  thumbnailUrl    String?           // Generated thumbnail location
+  uploadTime      DateTime          @default(now())
+  reviewStatus    PhotoReviewStatus @default(PENDING)
+  isPublic        Boolean           @default(false) // Visible in general gallery after approval
+  metadata        Json?             // Store things like EXIF data if needed
+  createdAt       DateTime          @default(now())
+  updatedAt       DateTime          @updatedAt
+
+  event         Event                   @relation(fields: [eventId], references: [id], onDelete: Cascade)
+  uploader      User                    @relation("UploadedByUser", fields: [uploaderUserId], references: [id], onDelete: Cascade)
+  detectedFaces DetectedFace[]
+  matches       PhotoParticipantMatch[]
+
+  @@index([eventId])
+  @@index([uploaderUserId])
+  @@index([reviewStatus])
+}
+
+model DetectedFace {
+  id             String   @id @default(cuid())
+  photoId        String
+  boundingBox    Json     // Store coordinates [x, y, width, height]
+  faceDescriptor Bytes?   // Binary/Vector data from FR service (use Bytes for binary) - Optional if only storing matches
+  createdAt      DateTime @default(now())
+
+  photo EventPhoto @relation(fields: [photoId], references: [id], onDelete: Cascade)
+
+  @@index([photoId])
+}
+
+model PhotoParticipantMatch {
+  id             String    @id @default(cuid())
+  photoId        String
+  participantId  String
+  confidenceScore Float?    // Confidence score from FR service
+  matchTime      DateTime  @default(now())
+  createdAt      DateTime  @default(now())
+
+  photo       EventPhoto  @relation(fields: [photoId], references: [id], onDelete: Cascade)
+  participant Participant @relation(fields: [participantId], references: [id], onDelete: Cascade)
+
+  @@unique([photoId, participantId]) // Prevent duplicate matches for the same photo/participant
+  @@index([photoId])
+  @@index([participantId])
+}
+
+model FaceMatchingTask {
+  id            String                 @id @default(cuid())
+  eventId       String
+  status        FaceMatchingTaskStatus @default(PENDING)
+  startTime     DateTime?
+  completionTime DateTime?
+  awsRequestId  String?                // ID from the Lambda invocation if applicable
+  errorDetails  String?
+  createdAt     DateTime               @default(now())
+  updatedAt     DateTime               @updatedAt
+
+  event Event @relation(fields: [eventId], references: [id], onDelete: Cascade)
+
+  @@index([eventId])
+  @@index([status])
+}
+
+model SubscriptionPlan {
+  id            String   @id @default(cuid()) // Internal ID
+  stripePriceId String   @unique // Link to Stripe Price object
+  name          String
+  description   String?
+  features      Json?    // Store list of features as JSON
+  price         Float    // Store price for display/reference (Stripe is source of truth)
+  currency      String   // e.g., usd
+  interval      String   // e.g., month, year
+  isActive      Boolean  @default(true)
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  subscriptions Subscription[]
+}
+
+model Subscription {
+  id                  String             @id @default(cuid()) // Internal ID
+  orgId               String
+  planId              String
+  stripeSubscriptionId String             @unique // Link to Stripe Subscription object
+  status              SubscriptionStatus
+  startDate           DateTime
+  endDate             DateTime?          // For subscriptions that have ended
+  trialEndDate        DateTime?
+  currentPeriodEnd    DateTime           // When the current billing period ends (managed by Stripe webhooks)
+  createdAt           DateTime           @default(now())
+  updatedAt           DateTime           @updatedAt
+
+  organization Organization     @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  plan         SubscriptionPlan @relation(fields: [planId], references: [id]) // Don't cascade delete plan
+  payments     Payment[]
+
+  @@index([orgId])
+  @@index([planId])
+  @@index([status])
+}
+
+model Payment {
+  id               String        @id @default(cuid()) // Internal ID
+  orgId            String
+  subscriptionId   String?       // Optional link if payment is for a subscription
+  stripeChargeId   String        @unique // Link to Stripe Charge/PaymentIntent
+  amount           Float
+  currency         String
+  status           PaymentStatus
+  paymentDate      DateTime
+  invoiceId        String?       // Optional link to internal Invoice record
+  createdAt        DateTime      @default(now())
+
+  organization Organization  @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  subscription Subscription? @relation(fields: [subscriptionId], references: [id], onDelete: SetNull) // Don't delete payment if subscription is deleted
+  invoice      Invoice?      @relation(fields: [invoiceId], references: [id], onDelete: SetNull)
+
+  @@index([orgId])
+  @@index([subscriptionId])
+  @@index([invoiceId])
+}
+
+model Invoice {
+  id             String        @id @default(cuid()) // Internal ID
+  orgId          String
+  stripeInvoiceId String        @unique // Link to Stripe Invoice
+  amountDue      Float
+  amountPaid     Float
+  currency       String
+  dueDate        DateTime?
+  paymentDate    DateTime?     // Date the invoice was paid
+  status         InvoiceStatus
+  pdfUrl         String?       // URL from Stripe for the invoice PDF
+  createdAt      DateTime      @default(now())
+
+  organization Organization @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  payment      Payment[]    // An invoice might have multiple partial payments, though usually one
+
+  @@index([orgId])
+  @@index([status])
+}
+
+model ConsentLog {
+  id        String            @id @default(cuid())
+  userId    String
+  eventId   String?           // Optional: Consent might be event-specific
+  participantId String?       // Optional: Link to participant record if event-specific
+  type      ConsentType
+  status    ConsentActionStatus // Granted or Revoked
+  timestamp DateTime          @default(now())
+  details   String?           // e.g., version of policy agreed to, IP address
+
+  user        User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  event       Event?       @relation(fields: [eventId], references: [id], onDelete: SetNull)
+  participant Participant? @relation(fields: [participantId], references: [id], onDelete: SetNull)
+
+  @@index([userId])
+  @@index([eventId])
+  @@index([participantId])
+  @@index([type])
+}
